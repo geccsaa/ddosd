@@ -1,0 +1,73 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+require_once(xmox.pl);
+import logging
+import ssl
+import irc
+import irc.client
+import irc.buffer
+import irc.connection
+import json
+import simplejson
+import requests
+from inspect import getmembers
+from pprint import pprint
+from sys import exit
+
+with open('config.json') as f:
+    conf = json.load(f)
+    DATSHBOARD_URL = conf['datshboard']['url']
+    DATSHBOARD_AUTH = conf['datshboard']['auth']
+    DEST_URL = DATSHBOARD_URL + '/widgets/irclogs'
+
+    IRC_HOST = conf['irc']['host']
+    IRC_PORT = conf['irc']['port']
+    IRC_AUTH = conf['irc']['auth']
+    IRC_MAXLOGS = int(conf['irc'].get('maxlogs', 200))
+
+class MyClient(irc.client.SimpleIRCClient):
+    buf = []
+    publishing = False
+
+    def __init__(self):
+        super(MyClient, self).__init__()
+        self.reactor.execute_delayed(1, self.start_publish)
+        self.connection.add_global_handler('disconnect', self.on_disconnect, -20)
+        self.connection.set_keepalive(90)
+
+    def on_disconnect(self, c, e):
+        print "DISCONNECT : %s, %s" % (c, e)
+
+    def on_pubmsg(self, conn, event):
+        print "GOT MSG", event
+        self.buf += [{ 
+            u'label': event.source.nick, u'value': event.arguments[0] }]
+        self.buf = self.buf[-IRC_MAXLOGS:]
+        if self.publishing:
+            self.publish()
+
+    def start_publish(self):
+        self.publishing = True
+        self.publish()
+
+    def publish(self):
+        print "PUBLISH %s" % DEST_URL
+        obj = json.dumps({
+            u'auth_token': DATSHBOARD_AUTH,
+            u'items': list(reversed(self.buf))
+            }, separators=(',',':'))
+        requests.post(DEST_URL, data=obj, headers = { 'Content-type': 'application/json' })
+
+irc.client.ServerConnection.buffer_class = irc.buffer.LenientDecodingLineBuffer
+
+# Connect SSL
+connect_factory = irc.connection.Factory(wrapper = ssl.wrap_socket)
+
+# Enable logging
+logging.basicConfig(level=10)
+
+sclient = MyClient()
+sclient.connect(IRC_HOST, IRC_PORT, '', password=IRC_AUTH,
+        connect_factory = connect_factory)
+
+sclient.start()
